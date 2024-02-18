@@ -42,7 +42,6 @@ fn check_typ(context: *TypContext, node: *Ast, typ: *Typ) (bool | ShouldDefer) =
 			return x == typ;
 	};
 };
-
 fn infer_typ(context: *TypContext, node: *Ast, typ: *Typ) bool = {
 	match (node.typ) {	
 		case null => {
@@ -53,7 +52,6 @@ fn infer_typ(context: *TypContext, node: *Ast, typ: *Typ) bool = {
 			return x == typ;
 	};
 };
-
 fn apply_rule_var(context: *TypContext, goal: *Ast)
 (bool | ShouldDefer | DoesNotApply) = {
 	fmt::println("executing rule: var")!;
@@ -73,7 +71,6 @@ fn apply_rule_var(context: *TypContext, goal: *Ast)
 		return infer_typ(context, goal, luv as *Typ);
 	};
 };
-
 fn apply_rule_int(context: *TypContext, goal: *Ast)
 (bool | ShouldDefer | DoesNotApply) = {
 	fmt::println("executing rule: int")!;
@@ -82,10 +79,8 @@ fn apply_rule_int(context: *TypContext, goal: *Ast)
 		return DoesNotApply;
 	};
 	fmt::println("\tgot int, forcing infer")!;
-	fmt::println("\tlookup succeeded, forcing infer")!;
 	return infer_typ(context, goal, &context.pool.buckets[0].1[0]);
 };
-
 fn apply_rule_app(context: *TypContext, goal: *Ast)
 (bool | ShouldDefer | DoesNotApply) = {
 	fmt::println("executing rule: app")!;
@@ -129,6 +124,26 @@ fn apply_rule_app(context: *TypContext, goal: *Ast)
 	fmt::println("\tchecks passed, forcing inference")!;
 	return infer_typ(context, goal, proto.rets);
 	//return false;
+};
+type Rule = *fn(*TypContext, *Ast) (bool|ShouldDefer|DoesNotApply);
+fn apply_rules(context: *TypContext, rules: *[]Rule, goal: *Ast)
+(bool|ShouldDefer) = {
+	for (let ri : size = 0; ri < len(rules); ri += 1) {
+		let attempt = rules[ri](context, goal);
+		match (attempt) {
+			case let i : ShouldDefer => {
+				return ShouldDefer;
+			};
+				case let i : DoesNotApply => {
+				yield;
+			};
+			case let success : bool => if (!success) {
+				fmt::println("TypeCheckFailed")!;
+				return false;
+			};
+		};
+	};
+	return true;
 };
 
 export fn main() void = {
@@ -215,65 +230,25 @@ export fn main() void = {
 	// typechecker
 	let deferred : bool = true;
 	fmt::println("==================== TYPECHECKING")!;
-	const rules : [_]*fn(*TypContext, *Ast) (bool|ShouldDefer|DoesNotApply)
+	const rules : []Rule
 		= [&apply_rule_var, &apply_rule_int, &apply_rule_app];
 	for (deferred) {
 		fmt::println("\t\t ==== scanning vars ====")!;
 		deferred = false;
 		for (let i : size = 0; i < len(goals); i += 1) {
 			if (!(goals[i].typ is null)) continue;
-			fmt::println("testing rule: var")!;
-			let attempt = apply_rule_var(&context, goals[i]);
-			match (attempt) {
-				case let i : ShouldDefer => {
-					fmt::println("\tdeferred")!;	
+			let ruleres = apply_rules(&context, &rules, goals[i]);
+			match (ruleres) {
+				case ShouldDefer =>
 					deferred = true;
-					continue;
-				};
-				case let i : DoesNotApply => {
-					yield;
-				};
-				case let success : bool => if (!success) {
-					fmt::println("TypeCheckFailed")!;
-					return;
-				};
-			};
-			fmt::println("testing rule: int")!;
-			let attempt = apply_rule_int(&context, goals[i]);
-			match (attempt) {
-				case let i : ShouldDefer => {
-					fmt::println("\tdeferred")!;	
-					deferred = true;
-					continue;
-				};
-				case let i : DoesNotApply => {
-					yield;
-				};
-				case let success : bool => if (!success) {
-					fmt::println("TypeCheckFailed")!;
-					return;
-				};
-			};
-			fmt::println("testing rule: app")!;
-			let attempt = apply_rule_app(&context, goals[i]);
-			match (attempt) {
-				case let i : ShouldDefer => {
-					fmt::println("\tdeferred")!;	
-					deferred = true;
-					continue;
-				};
-				case let i : DoesNotApply => {
-					yield;
-				};
-				case let success : bool => if (!success) {
-					fmt::println("TypeCheckFailed")!;
-					return;
+				case let succ : bool => if (succ) {
+					fmt::println("TypeChecking failed")!;
+					break;
 				};
 			};
 		};
 	};
 	fmt::println("==================== TYPECHECKING")!;
-	fmt::println("Type Checked Successfully")!;
 	fmt::println("Printing inferred types")!;
 	for (let i : size = 0; i < len(goals); i += 1) {
 		debug_ast(goals[i])!;
