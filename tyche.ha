@@ -1,266 +1,239 @@
-// Type Checker in Hare
-// Very simple type checker
-// 
-// features [state]
-// 	inference [in progress]
-// 	validation [in progress]
-//	generics [planned]
-//
-// phases
-// 	AST tagging
-// 		All AST nodes aer assigned a type.
-// 		Type inference is performed here
-// 		Failure to tag a node is an error.
-// 	validation
-// 		Checks if all the types hold to their promises.
-// 
-// details
-// 	notation stuffs
-// 		`=>` infer type (conlude: Assign)
-// 		`<=` check type 
-// 		`:` has type by definition
-// 	current type rules
-//		(I've not implemented any)
-//	planned rules
-//		- If we've already typed an identifier, we can infer that it
-//		- hasn't changed
-//		if  | Γ# x : A
-//		then| Γ# x => A
-//		
-//		if  | Γ#
+// Implementing a constraint solver based system
+//  as shown in https://www.youtube.com/watch?v=-TJGhGa04F8&t=3215s
+
+// Simpler than before, since we don't have TypeClasses (or traits)
 
 use fmt;
+use io;
 
-type ShouldDefer = !void;
-type DoesNotApply = void;
+type Scheme = (Type|TypeVar|TypeCons);
+type Type = size;
+type TypeVar = size;
+type TypeCons = struct {
+	cons : ConsId,
+	args: []Scheme,
+};
+type ConsId = size;
 
-fn check_typ(context: *TypContext, node: *Ast, typ: *Typ) (bool | ShouldDefer) = {
-	match (node.typ) {
-		case null =>
-			return ShouldDefer;
-		case let x : *Typ =>
-			return x == typ;
-	};
-};
-fn infer_typ(context: *TypContext, node: *Ast, typ: *Typ) bool = {
-	match (node.typ) {	
-		case null => {
-			node.typ = typ;
-			return true;
-		};
-		case let x : *Typ =>
-			return x == typ;
-	};
-};
-fn apply_rule_var(context: *TypContext, goal: *Ast)
-(bool | ShouldDefer | DoesNotApply) = {
-	fmt::println("executing rule: var")!;
-	defer fmt::println("finishing rule: var")!;
-	let inner : IdentId = if (goal.val is IdentN) {
-		yield (goal.val as IdentN).id ;
-	} else {
-		return DoesNotApply;
-	};
-	fmt::println("\tgot var, looking up in context")!;
-	let luv = lookup(context, inner);
-	if (luv is null) {
-		fmt::println("\tlookup failed")!;
-		return ShouldDefer;
-	} else {
-		fmt::println("\tlookup succeeded, forcing infer")!;
-		return infer_typ(context, goal, luv as *Typ);
-	};
-};
-fn apply_rule_int(context: *TypContext, goal: *Ast)
-(bool | ShouldDefer | DoesNotApply) = {
-	fmt::println("executing rule: int")!;
-	defer fmt::println("finishing rule: var")!;
-	if (!(goal.val is IntLitN)) {
-		return DoesNotApply;
-	};
-	fmt::println("\tgot int, forcing infer")!;
-	return infer_typ(context, goal, &context.pool.buckets[0].1[0]);
-};
-fn apply_rule_app(context: *TypContext, goal: *Ast)
-(bool | ShouldDefer | DoesNotApply) = {
-	fmt::println("executing rule: app")!;
-	defer fmt::println("finishing rule: app")!;
-	if (!(goal.val is FuncCallN)) {
-		return DoesNotApply;
-	};
-	fmt::println("\tgot func, checking deferral")!;
-	let inner : FuncCallN = goal.val as FuncCallN;
-	if (inner.targe.typ is null) {
-		return ShouldDefer;
-	};
-	for (let i : size = 0; i < len(inner.args); i += 1) {	
-		if (inner.args[i].typ is null) {
-			return ShouldDefer;
+fn show_scheme(scheme: Scheme) (void|io::error) = {
+	match (scheme) {
+		case let typ : Type =>
+			fmt::printf("T{}", typ : size)?;
+		case let var : TypeVar => 
+			fmt::printf("@{}", var : size)?;
+		case let con : TypeCons => {
+			fmt::printf("${}<", con.cons : size)?;
+			for (let i : size = 0; i < len(con.args); i += 1) {
+				show_scheme(con.args[i])?;
+				if (i + 1 < len(con.args)) {
+					fmt::print(", ")?;
+				};
+			};
+			fmt::print(">")?;
 		};
 	};
-	fmt::println("\tDeferrals checked, checking reciever and prototype")!;
-	let proto = if (inner.targe.typ is *Typ) {
-		let inner = inner.targe.typ as *Typ;
-		// Can Only call functions
-		if (!(inner.repr is FuncT)) {
+};
+
+type Goal = GoalEq;
+
+type GoalEq = (Scheme, Scheme);
+
+
+type SubMap = [](TypeVar, Scheme);
+
+fn deref_sub(map: *SubMap, var: TypeVar) Scheme = {
+	let ret = var : Scheme;
+	for (ret is TypeVar) {
+		let got = deref_sub_single(map, ret as TypeVar);
+		if (got is void) {
+			break;
+		};
+		ret = got as Scheme;
+	};
+	return ret;
+};
+
+fn deref_sub_single(map: *SubMap, var: TypeVar) (Scheme|void) = {
+	for (let i : size = 0; i < len(map); i += 1) {
+		if (map[i].0 == var) {
+			return map[i].1;
+		};
+	};
+	return;
+};
+
+fn quick_deref(map: *SubMap, scheme: Scheme) Scheme = {
+	return if (scheme is TypeVar) deref_sub(map, scheme as TypeVar)
+	else scheme;
+};
+
+type Solver = struct {
+	goals: []Goal,
+	backburner: []Goal,
+	error_bag: []Goal,
+	subs: SubMap,
+};
+
+fn prep_pass(this: *Solver) void = {
+	for (len(this.backburner) > 0) {
+		append(this.goals, this.backburner[0]);
+		delete(this.backburner[0]);
+	};
+};
+
+// returns false when there's nothing left to do :)
+fn solve_step(this: *Solver) bool = {
+	for (let i : size = 0; i < len(this.goals); i += 1) {
+		if (try_solve(this, &this.goals[i])) {
+			fmt::println("goal satisfied, removing")!;
+			delete(this.goals[i]);
+			i -= 1;
+		} else {
+			fmt::println("goal failed, putting into error bag")!;
+			let clone = this.goals[i];
+			delete(this.goals[i]);
+			append(this.error_bag, clone);
 			return false;
 		};
-		yield &(inner.repr as FuncT);
-	} else {
-		abort("Type unset during deferral check");
 	};
-	fmt::println("\tchecking function args")!;
-	// wrong number of args
-	if (len(proto.args) != len(inner.args)) {
+	return len(this.goals) != 0;
+};
+
+fn try_solve(this: *Solver, goal: *Goal) bool = {
+	let copy = *goal : GoalEq; // Will require updating :)
+	let copy = (
+		quick_deref(&this.subs, copy.0),
+		quick_deref(&this.subs, copy.1));
+
+	fmt::print("testing:: ")!;
+	show_scheme(copy.0)!;
+	fmt::print(" ~ ")!;
+	show_scheme(copy.1)!;
+	fmt::println(";")!;
+
+
+	if (copy.0 is TypeVar || copy.1 is TypeVar) {
+		let var = (if (copy.0 is TypeVar) copy.0 else copy.1) as TypeVar;
+		let val = (if (copy.0 is TypeVar) copy.1 else copy.0);
+		append(this.subs, (var, val));
+		return true;
+	};
+	
+	fmt::println("resorting to unification")!;
+	// assume unify
+	let dump = [] : []Goal;
+	defer free(dump);
+	let unif = unify_to_goals(this, &dump, copy.0, copy.1);
+	fmt::printfln("\tunification success: {}", unif)!;
+	if (!unif) return false;
+	for (let i : size = 0; i < len(dump); i += 1) {
+		append(this.goals, dump[i]);
+	};
+	return true;
+};
+
+// This function makes a lot of assumptions:
+// 	1) `dump` isn't the actual goal pool
+// 	2) variables are substituted by the solver
+// 	3) `Scheme` is an immutable type (we do some dirty copying)
+// 	4) This function doesn't own any of its arguments.
+fn unify_to_goals(this: *Solver, dump: *[]Goal, a: Scheme, b: Scheme) bool = {
+	let a = quick_deref(&this.subs, a);
+	let b = quick_deref(&this.subs, b);
+	if (a is TypeVar || b is TypeVar) {
+		append(dump, (a, b) : GoalEq );
+		return true;
+	};
+	if (a is Type && b is Type) {
+		return a as Type == b as Type;
+	};
+	if (a is TypeCons && b is TypeCons) {
+		return unify_typecons(
+			this, dump,
+			a as TypeCons, 
+			b as TypeCons);
+	};
+	return false;
+};
+
+fn unify_typecons(this: *Solver, dump: *[]Goal, a: TypeCons, b: TypeCons) bool = {
+	if (a.cons != b.cons) {
 		return false;
 	};
-	for (let i : size = 0; i < len(proto.args); i += 1) {
-		// mismatch param args
-		match (check_typ(context, inner.args[i], proto.args[i])) {
-			case ShouldDefer => return ShouldDefer;
-			case let ma : bool => if (!ma) {return false;};
-		};
+	if (len(a.args) != len(b.args)) {
+		return false;
 	};
-	fmt::println("\tchecks passed, forcing inference")!;
-	return infer_typ(context, goal, proto.rets);
-	//return false;
-};
-type Rule = *fn(*TypContext, *Ast) (bool|ShouldDefer|DoesNotApply);
-fn apply_rules(context: *TypContext, rules: *[]Rule, goal: *Ast)
-(bool|ShouldDefer) = {
-	for (let ri : size = 0; ri < len(rules); ri += 1) {
-		let attempt = rules[ri](context, goal);
-		match (attempt) {
-			case let i : ShouldDefer => {
-				return ShouldDefer;
-			};
-				case let i : DoesNotApply => {
-				yield;
-			};
-			case let success : bool => if (!success) {
-				fmt::println("TypeCheckFailed")!;
-				return false;
-			};
+	for (let i : size = 0; i < len(a.args); i += 1) {
+		if (!unify_to_goals(this, dump, a.args[i], b.args[i])) {
+			return false;
 		};
 	};
 	return true;
 };
 
 export fn main() void = {
-	fmt::println("typing shit boio")!;
-
-	let pool = TypPool { buckets = [] };
-	let context = TypContext { ident_map = [], pool = &pool, outer = null };
-	defer drop_context(&context);
-	defer drop_pool(&pool);
-
-	// defining a type and defining an ident with that type
-	fmt::println("Creating int type")!;
-	let intT = Typ{name = "int", repr = PrimitiveT};
-	let intT = register_typ(&pool, intT);
-	fmt::print("created: ")!; print_typ(intT)!; fmt::print("\n")!;
-
-	fmt::println("Creating float type")!;
-	let floatT = Typ{name = "float", repr = PrimitiveT};
-	let floatT = register_typ(&pool, floatT);
-	fmt::print("created: ")!; print_typ(floatT)!; fmt::print("\n")!;
-
-	fmt::println("Creating func type `fn (int) float` ")!;
-	let funcT = Typ{name = void, repr = FuncT {
-		rets = floatT,
-		args = [intT, intT],
-	}};
-	let funcT = register_typ(&pool, funcT);
-	fmt::print("created: ")!; print_typ(funcT)!; fmt::print("\n")!;
-
-	// Binding to idents
-	insert_context(&context, 0, intT)!;
-	insert_context(&context, 1, funcT)!;
+	fmt::println("Initialising shit first :)")!;
+	let solver = Solver { 
+		goals = [],
+		subs = [],
+		backburner = [],
+		error_bag = [],
+	};
 	
-	let source_base = "@1(@0, 5)";
-
-	let x : *Ast = {
-		let arg1 = alloc(Ast{
-			val = IdentN { id = 0 },
-			typ = null,
-			loc = SourceLoc {
-				blob  = &source_base,
-				start = 4,
-				end   = 6,
-			}
-		});
-		let arg2 = alloc(Ast{
-			val = 5: IntLitN,
-			typ = null,
-			loc = SourceLoc {
-				blob  = &source_base,
-				start = 7,
-				end   = 8,
-			}
-		});
-		let func = alloc(Ast{
-			val = IdentN { id = 1},
-			typ = null,
-			loc = SourceLoc {
-				blob  = &source_base,
-				start = 0,
-				end   = 3,
-			}
-		});
-
-		yield alloc(Ast{
-			val = FuncCallN { targe = func, args = [arg1, arg2] },
-			typ = null,
-			loc = SourceLoc {
-				blob  = &source_base,
-				start = 0,
-				end   = 9,
-			}
-		});
-	};
-
-	defer drop_ast(x);
-
-	// converting the ast into some type checking goals
-	let goals = goals_from_ast(x);
-
-	// going through them and just kinda applying rules :)
+	const typ_int   : Type    = 0x100;
+	const typ_float : Type    = 0x101;
+	const con_vec   : ConsId  = 0x201;
+	const typvar_T  : TypeVar = 0;
+	const typvar_A  : TypeVar = 1;
+	const typvar_C  : TypeVar = 2;
 	
-	// imagine we've deferred type checking while initialising the
-	// typechecker
-	let deferred : bool = true;
-	fmt::println("==================== TYPECHECKING")!;
-	const rules : []Rule
-		= [&apply_rule_var, &apply_rule_int, &apply_rule_app];
-	for (deferred) {
-		fmt::println("\t\t ==== scanning vars ====")!;
-		deferred = false;
-		for (let i : size = 0; i < len(goals); i += 1) {
-			if (!(goals[i].typ is null)) continue;
-			let ruleres = apply_rules(&context, &rules, goals[i]);
-			match (ruleres) {
-				case ShouldDefer =>
-					deferred = true;
-				case let succ : bool => if (succ) {
-					fmt::println("TypeChecking failed")!;
-					break;
-				};
-			};
-		};
-	};
-	fmt::println("==================== TYPECHECKING")!;
-	fmt::println("Printing inferred types")!;
-	for (let i : size = 0; i < len(goals); i += 1) {
-		debug_ast(goals[i])!;
-		fmt::print(": ")!;
-		match (goals[i].typ) {
-		case let typ : *Typ =>
-			print_typ(typ)!;
-		case null =>
-			fmt::print("!!UNTYPED!!")!;
-		};
-		fmt::print("\n")!;
-	};
+	// We're testing using
+	// 	`vec::push(&nums, 5);`
+	// So
+	// 	unify Vec<@0> with Vec<@1>
+	// 	unify @1 with Int
 
+	fmt::println("initialising solver")!;
+	let goal = (
+		TypeCons{ cons = con_vec, args = [typvar_T] },
+		TypeCons{ cons = con_vec, args = [typvar_A] }
+	) : GoalEq;
+	append(solver.goals, goal);
 
+	let goal = (
+		typvar_A,
+		typ_int,
+	) : GoalEq;
+	append(solver.goals, goal);
+	let goal = (
+		TypeCons{ cons = con_vec, args = [typvar_T] },
+		TypeCons{ cons = con_vec, args = [typvar_C] }
+	) : GoalEq;
+	append(solver.goals, goal);
+	let goal = (
+		typvar_C,
+		typ_float,
+	) : GoalEq;
+	append(solver.goals, goal);
+	prep_pass(&solver);
+	for (demo_step(&solver)) {yield;};
+
+	if (len(solver.error_bag) > 0) {
+		fmt::println("There are some errors")!;
+	} else {
+		fmt::println("No errors accrued")!;
+	};
+};
+
+fn demo_step(solver: *Solver) bool = {
+	let suc = solve_step(solver);
+	fmt::printfln("stepping solver: {}", suc)!;
+	fmt::println("printing states")!;
+	for (let i : size = 0; i < len(solver.subs); i += 1) {
+		let sub = solver.subs[i];
+		fmt::printf("@{} -> ", sub.0 : size)!;
+		show_scheme(sub.1)!;
+		fmt::println("")!;
+	};
+	return suc;
 };
