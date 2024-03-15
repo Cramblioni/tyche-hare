@@ -8,23 +8,39 @@ use io;
 
 type Scheme = (Type|TypeVar|TypeCons);
 type Type = size;
-type TypeVar = size;
+type TypeVar = (size|void);
 type TypeCons = struct {
 	cons : ConsId,
-	args: []Scheme,
+	args: []size,
 };
 type ConsId = size;
+type SchemeTable = []Scheme;
 
-fn show_scheme(scheme: Scheme) (void|io::error) = {
+type Names = struct {
+	types: []str,
+	cons: []str,
+};
+
+fn show_scheme
+(table: *SchemeTable, names: *Names, scheme: size)
+(void|io::error) = {
+	let schemei = deref(table, scheme);
+	let scheme = table[schemei];
+	return show_scheme_i(table, names, scheme);
+};
+fn show_scheme_i
+(table: *SchemeTable, names: *Names, scheme: Scheme)
+(void|io::error) = {
 	match (scheme) {
 		case let typ : Type =>
-			fmt::printf("T{}", typ : size)?;
-		case let var : TypeVar => 
-			fmt::printf("@{}", var : size)?;
+//			fmt::printf("T{}", typ : size)?;
+			fmt::print(names.types[typ])?;
+		case let var : TypeVar => show_var_i(table, var)?;
 		case let con : TypeCons => {
-			fmt::printf("${}<", con.cons : size)?;
+//			fmt::printf("${}<", con.cons : size)?;
+			fmt::printf("{}<", names.cons[con.cons])?;
 			for (let i : size = 0; i < len(con.args); i += 1) {
-				show_scheme(con.args[i])?;
+				show_scheme(table, names, con.args[i])?;
 				if (i + 1 < len(con.args)) {
 					fmt::print(", ")?;
 				};
@@ -34,129 +50,95 @@ fn show_scheme(scheme: Scheme) (void|io::error) = {
 	};
 };
 
-type Goal = GoalEq;
-
-type GoalEq = (Scheme, Scheme);
-
-
-type SubMap = [](TypeVar, Scheme);
-
-fn deref_sub(map: *SubMap, var: TypeVar) Scheme = {
-	let ret = var : Scheme;
-	for (ret is TypeVar) {
-		let got = deref_sub_single(map, ret as TypeVar);
-		if (got is void) {
-			break;
-		};
-		ret = got as Scheme;
-	};
-	return ret;
-};
-
-fn deref_sub_single(map: *SubMap, var: TypeVar) (Scheme|void) = {
-	for (let i : size = 0; i < len(map); i += 1) {
-		if (map[i].0 == var) {
-			return map[i].1;
-		};
+fn show_var_i(table: *SchemeTable, var: TypeVar) (void|io::error) = {
+	match (var) {
+		case void => fmt::print("<Unbound>")?;
+		case let ind : size =>
+			fmt::printf("<Bound:{}>", ind)?;
 	};
 	return;
 };
 
-fn quick_deref(map: *SubMap, scheme: Scheme) Scheme = {
-	return if (scheme is TypeVar) deref_sub(map, scheme as TypeVar)
-	else scheme;
+type Goal = struct {
+	source: (GoalEq|void),
+	cons: (GoalEq|void),
+};
+type GoalEq = (size, size);
+
+fn into_goal(goal: GoalEq) Goal = Goal { source = goal, cons = goal };
+
+fn deref(table: *SchemeTable, ind: size) size = {
+	let ind = ind;
+	let got = table[ind];
+	for (got is TypeVar; got = table[ind]) {
+		let ref = got as TypeVar;
+		if (ref is void) {return ind;};
+		ind = ref as size;
+	};
+	return ind;
 };
 
 type Solver = struct {
+	table: SchemeTable,
+	remap_bag: []size,
 	goals: []Goal,
-	backburner: []Goal,
 	error_bag: []Goal,
-	subs: SubMap,
 };
 
-fn prep_pass(this: *Solver) void = {
-	for (len(this.backburner) > 0) {
-		append(this.goals, this.backburner[0]);
-		delete(this.backburner[0]);
+fn bind(this: *Solver, a: size, b: size) void = {
+	this.table[a] = b : TypeVar;
+	append(this.remap_bag, a);
+};
+
+fn commit_binds(this: *Solver) void = {
+	if (len(this.remap_bag) == 0) return;
+	for (let i = len(this.remap_bag) - 1; i >= 0; i -= 1) {
+		delete(this.remap_bag[i]);
 	};
 };
 
-// returns false when there's nothing left to do :)
-fn solve_step(this: *Solver) bool = {
-	for (let i : size = 0; i < len(this.goals); i += 1) {
-		if (try_solve(this, &this.goals[i])) {
-			fmt::println("goal satisfied, removing")!;
-			delete(this.goals[i]);
-			i -= 1;
-		} else {
-			fmt::println("goal failed, putting into error bag")!;
-			let clone = this.goals[i];
-			delete(this.goals[i]);
-			append(this.error_bag, clone);
-			return false;
-		};
+fn clear_binds(this: *Solver) void = {
+	if (len(this.remap_bag) == 0) return;
+	for (let i = len(this.remap_bag) - 1; i >= 0; i -= 1) {
+		this.table[this.remap_bag[i]] = void : TypeVar;
+		delete(this.remap_bag[i]);
 	};
-	return len(this.goals) != 0;
-};
-
-fn try_solve(this: *Solver, goal: *Goal) bool = {
-	let copy = *goal : GoalEq; // Will require updating :)
-	let copy = (
-		quick_deref(&this.subs, copy.0),
-		quick_deref(&this.subs, copy.1));
-
-	fmt::print("testing:: ")!;
-	show_scheme(copy.0)!;
-	fmt::print(" ~ ")!;
-	show_scheme(copy.1)!;
-	fmt::println(";")!;
-
-
-	if (copy.0 is TypeVar || copy.1 is TypeVar) {
-		let var = (if (copy.0 is TypeVar) copy.0 else copy.1) as TypeVar;
-		let val = (if (copy.0 is TypeVar) copy.1 else copy.0);
-		append(this.subs, (var, val));
-		return true;
-	};
-	
-	fmt::println("resorting to unification")!;
-	// assume unify
-	let dump = [] : []Goal;
-	defer free(dump);
-	let unif = unify_to_goals(this, &dump, copy.0, copy.1);
-	fmt::printfln("\tunification success: {}", unif)!;
-	if (!unif) return false;
-	for (let i : size = 0; i < len(dump); i += 1) {
-		append(this.goals, dump[i]);
-	};
-	return true;
 };
 
 // This function makes a lot of assumptions:
-// 	1) `dump` isn't the actual goal pool
-// 	2) variables are substituted by the solver
-// 	3) `Scheme` is an immutable type (we do some dirty copying)
-// 	4) This function doesn't own any of its arguments.
-fn unify_to_goals(this: *Solver, dump: *[]Goal, a: Scheme, b: Scheme) bool = {
-	let a = quick_deref(&this.subs, a);
-	let b = quick_deref(&this.subs, b);
-	if (a is TypeVar || b is TypeVar) {
-		append(dump, (a, b) : GoalEq );
+// 	1) `dump` is a temporary goal pool
+// 	2) the solver does the substitutions
+// (using jotter-tables makes memory management assumptions true)
+// (the ownership one is wrong, as we own our indexes)
+fn unify
+(this: *Solver, dump: *[]Goal, source: Goal, a: size, b: size )
+bool = {
+	let ai = deref(&this.table, a);
+	let a = this.table[ai];
+	let bi = deref(&this.table, b);
+	let b = this.table[bi];
+	if (a is TypeVar) {
+		this.table[ai] = bi : TypeVar;
+		return true;
+	};
+	if (b is TypeVar) {
+		this.table[bi] = ai : TypeVar;
 		return true;
 	};
 	if (a is Type && b is Type) {
 		return a as Type == b as Type;
 	};
 	if (a is TypeCons && b is TypeCons) {
-		return unify_typecons(
-			this, dump,
-			a as TypeCons, 
-			b as TypeCons);
+		return unify_typecons(this, dump, source, ai, bi);
 	};
 	return false;
 };
 
-fn unify_typecons(this: *Solver, dump: *[]Goal, a: TypeCons, b: TypeCons) bool = {
+fn unify_typecons
+(this: *Solver, dump: *[]Goal, source: Goal, ai: size, bi: size)
+bool = {
+	let a = this.table[ai] as TypeCons; 
+	let b = this.table[bi] as TypeCons;
 	if (a.cons != b.cons) {
 		return false;
 	};
@@ -164,76 +146,135 @@ fn unify_typecons(this: *Solver, dump: *[]Goal, a: TypeCons, b: TypeCons) bool =
 		return false;
 	};
 	for (let i : size = 0; i < len(a.args); i += 1) {
-		if (!unify_to_goals(this, dump, a.args[i], b.args[i])) {
-			return false;
-		};
+		fmt::printfln("pushing goal to unify {} and {}",
+			a.args[i], b.args[i])!;
+		append(dump, Goal {
+			source = source.source,
+			cons = (a.args[i], b.args[i]) : GoalEq,
+		});
 	};
 	return true;
 };
 
 export fn main() void = {
 	fmt::println("Initialising shit first :)")!;
+
+	const typ_int   : Type    = 0x00;
+	const typ_float : Type    = 0x01;
+	const con_vec   : ConsId  = 0x00;
+	
+	const names = Names {
+		types = ["int", "float"],
+		cons = ["vec"],
+	};
+
 	let solver = Solver { 
+		table = [
+			(void : TypeVar),			 // 0:T
+			TypeCons { cons = con_vec, args = [0] }, // 1:$vec<T>
+			(void : TypeVar),			 // 2:A
+			TypeCons { cons = con_vec, args = [2] }, // 3:$vec<A>
+			(void: TypeVar),			 // 4:C
+			TypeCons { cons = con_vec, args = [4]},	 // 5:$vec<C>
+			typ_int,				 // 6:Tint
+			typ_float,				 // 7:Tfloat
+		],
+		remap_bag = [],
 		goals = [],
-		subs = [],
-		backburner = [],
 		error_bag = [],
 	};
-	
-	const typ_int   : Type    = 0x100;
-	const typ_float : Type    = 0x101;
-	const con_vec   : ConsId  = 0x201;
-	const typvar_T  : TypeVar = 0;
-	const typvar_A  : TypeVar = 1;
-	const typvar_C  : TypeVar = 2;
-	
-	// We're testing using
-	// 	`vec::push(&nums, 5);`
-	// So
-	// 	unify Vec<@0> with Vec<@1>
-	// 	unify @1 with Int
 
 	fmt::println("initialising solver")!;
-	let goal = (
-		TypeCons{ cons = con_vec, args = [typvar_T] },
-		TypeCons{ cons = con_vec, args = [typvar_A] }
-	) : GoalEq;
+	let goal = into_goal( ( 
+		1, // TypeCons{ cons = con_vec, args = [typvar_T] },
+		3, // TypeCons{ cons = con_vec, args = [typvar_A] }
+	) : GoalEq);
 	append(solver.goals, goal);
 
-	let goal = (
-		typvar_A,
-		typ_int,
-	) : GoalEq;
+	let goal = into_goal( (
+		2, // typvar_A,
+		6, // typ_int,
+	) : GoalEq);
 	append(solver.goals, goal);
-	let goal = (
-		TypeCons{ cons = con_vec, args = [typvar_T] },
-		TypeCons{ cons = con_vec, args = [typvar_C] }
-	) : GoalEq;
+	let goal = into_goal( (
+		1, // TypeCons{ cons = con_vec, args = [typvar_T] },
+		5, // TypeCons{ cons = con_vec, args = [typvar_C] }
+	) : GoalEq);
 	append(solver.goals, goal);
-	let goal = (
-		typvar_C,
-		typ_float,
-	) : GoalEq;
+	let goal = into_goal( (
+		4, //typvar_C,
+		7, //typ_float,
+	) : GoalEq);
 	append(solver.goals, goal);
-	prep_pass(&solver);
 	for (demo_step(&solver)) {yield;};
 
 	if (len(solver.error_bag) > 0) {
 		fmt::println("There are some errors")!;
+		for (let i: size = 0; i < len(solver.error_bag); i += 1) {
+			let goal = solver.error_bag[i].source as GoalEq;
+			fmt::print("tried to assign value of type ")!;
+			show_scheme(&solver.table, &names, goal.0)!;
+			fmt::print(" to reciever of type ")!;
+			show_scheme(&solver.table, &names, goal.1)!;
+			fmt::println("")!;
+		};
 	} else {
 		fmt::println("No errors accrued")!;
 	};
 };
 
 fn demo_step(solver: *Solver) bool = {
-	let suc = solve_step(solver);
-	fmt::printfln("stepping solver: {}", suc)!;
-	fmt::println("printing states")!;
-	for (let i : size = 0; i < len(solver.subs); i += 1) {
-		let sub = solver.subs[i];
-		fmt::printf("@{} -> ", sub.0 : size)!;
-		show_scheme(sub.1)!;
-		fmt::println("")!;
+	fmt::println("Running solve")!;
+	show_goals(&solver.goals);
+	fmt::println("")!;
+	return !random_shit(solver);
+};
+
+// returns true if finished
+fn random_shit(this: *Solver) bool = {
+	if (len(this.goals) == 0) return true;
+
+	let temp = alloc([] : []Goal, 8);
+	defer free(temp);
+
+	const suc = solve_goal(this, &temp, this.goals[0]);
+	if (suc) {
+		commit_binds(this);
+		for (let i: size = 0; i < len(temp); i += 1) {
+			append(this.goals, temp[i]);
+		};
+	} else {
+		clear_binds(this);
+		append(this.error_bag, this.goals[0]);
 	};
-	return suc;
+	delete(this.goals[0]);
+	return false;
+};
+
+fn solve_goal(this: *Solver, dump: *[]Goal, goal: Goal) bool = {
+	fmt::println("selecting strategy")!;
+	return match (goal.cons) {
+		case GoalEq =>
+			yield solve_eq(this, dump, goal, goal.cons as GoalEq);
+		case void => yield true;
+	};
+};
+
+fn solve_eq(this: *Solver, dump: *[]Goal, source: Goal, eq: GoalEq) bool = {
+	fmt::printfln("unifying : {} & {}", eq.0, eq.1)!;
+	return unify(this, dump, source, eq.0, eq.1);
+};
+
+fn show_goals(goals: *[]Goal) void = {
+	for (let i: size = 0; i < len(goals); i += 1) {
+		let goal = goals[i];
+		match (goal.cons) {
+			case void => fmt::print("<DEBUG>")!;
+			case let eq : GoalEq =>
+				fmt::printf("{} ~ {}", eq.0, eq.1)!;
+		};
+		if (i + 1 < len(goals)) {
+			fmt::print(" + ")!;
+		};
+	};
 };
